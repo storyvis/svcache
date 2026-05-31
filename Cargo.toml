@@ -1,0 +1,23 @@
+[package]
+name = "svcache"
+version = "0.1.0"
+edition = "2024"
+authors = ["lava bokam <lavajnv@gmail.com>"]
+description = "Isomorphic Dual-Index Cache for WASM and Native Runtimes"
+license = "Apache-2.0"
+repository = "https://github.com/storyvis/svcache"
+homepage = "https://github.com/storyvis/svcache"
+keywords = ["cache", "wasm", "dual-index", "dashmap", "concurrent"]
+categories = ["caching", "data-structures", "wasm"]
+readme = "README.md"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+
+# Only bring in DashMap when NOT targeting WebAssembly
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dashmap = "6.0"
+
+[dev-dependencies]
+chrono = { version = "0.4", features = ["serde", "clock"] }
