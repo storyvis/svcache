@@ -18,9 +18,11 @@
 //!   when a lookup hits them, by the eviction hand, by a bounded inline sweep that runs at
 //!   most once per [`SvCacheBuilder::cleanup_interval`], and by
 //!   [`SvCache::evict_expired_budget`] / [`SvCache::evict_expired`].
-//! * **Concurrency**: lookups (`get_*`, `update`, `touch`) take only the shard lock of the
-//!   entry they touch. Structural changes (insert of a new id, remove, eviction, sweep,
-//!   `load`, `clear`) serialize on one mutex that guards the eviction order.
+//! * **Concurrency**: lookups (`get_*`, `update`, `touch`) and re-inserts of an existing id
+//!   with an unchanged slug take only the shard lock of the entry they touch. Structural
+//!   changes (insert of a new id, slug change, remove, eviction, sweep, `load`, `clear`)
+//!   serialize on one mutex that guards the eviction order. The clock is sampled after the
+//!   relevant lock is held.
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -599,15 +601,45 @@ impl<T: CacheKey> SvCache<T> {
     }
 
     fn insert_iter(&self, items: impl IntoIterator<Item = T>) {
-        let now = self.now();
-        self.maybe_sweep(now);
         let mut out = self.evicted_sink();
-        let mut st = self.lock();
+        let mut st = None;
         for item in items {
-            self.insert_locked(&mut st, item, now, true, &mut out);
+            if let Err(item) = self.try_replace(item) {
+                let st = st.get_or_insert_with(|| self.lock());
+                self.insert_locked(st, item, true, &mut out);
+            }
         }
-        self.unlock(st);
+        if let Some(st) = st {
+            self.unlock(st);
+        }
         self.notify(out);
+        self.maybe_sweep(self.now());
+    }
+
+    /// Replaces the value of an existing entry whose slug (and slug ownership) is unchanged,
+    /// under its shard lock only. Hands the item back when the indices must change.
+    fn try_replace(&self, item: T) -> Result<(), T> {
+        let id = item.id();
+        if let Some(s) = item.slug()
+            && self.by_slug.read(s, |owner| *owner == id) != Some(true)
+        {
+            return Err(item);
+        }
+        let mut item = Some(item);
+        let replaced = self.by_id.write(&id, |e| {
+            if e.slug.as_deref() != item.as_ref().and_then(|i| i.slug()) {
+                return None;
+            }
+            let exp = self.expiry(self.now());
+            let cur = e.expires_at.get_mut();
+            *cur = (*cur).max(exp);
+            *e.visited.get_mut() = true;
+            Some(std::mem::replace(&mut e.value, item.take().expect("item")))
+        });
+        match replaced {
+            Some(Some(_old)) => Ok(()),
+            _ => Err(item.take().expect("item")),
+        }
     }
 
     pub fn get_by_id(&self, id: T::Id) -> Option<T> {
@@ -615,10 +647,9 @@ impl<T: CacheKey> SvCache<T> {
     }
 
     pub fn get_by_slug(&self, slug: &str) -> Option<T> {
-        let now = self.now();
-        self.maybe_sweep(now);
         let Some(id) = self.by_slug.read(slug, Clone::clone) else {
             self.misses.incr();
+            self.maybe_sweep(self.now());
             return None;
         };
         let r = self
@@ -627,10 +658,11 @@ impl<T: CacheKey> SvCache<T> {
                 if e.slug.as_deref() != Some(slug) {
                     return None;
                 }
-                Some(self.hit(e, now).then(|| e.value.clone()).ok_or(()))
+                let now = self.now();
+                Some((now, self.hit(e, now).then(|| e.value.clone()).ok_or(())))
             })
             .flatten();
-        self.finish(&id, r, now)
+        self.finish(&id, r)
     }
 
     /// Runs `f` on the cached value under the entry's shard read lock, without cloning it.
@@ -638,12 +670,11 @@ impl<T: CacheKey> SvCache<T> {
     /// `f` must not access this cache (it could deadlock on the same shard).
     #[inline]
     pub fn get_with<R>(&self, id: &T::Id, f: impl FnOnce(&T) -> R) -> Option<R> {
-        let now = self.now();
-        self.maybe_sweep(now);
-        let r = self
-            .by_id
-            .read(id, |e| self.hit(e, now).then(|| f(&e.value)).ok_or(()));
-        self.finish(id, r, now)
+        let r = self.by_id.read(id, |e| {
+            let now = self.now();
+            (now, self.hit(e, now).then(|| f(&e.value)).ok_or(()))
+        });
+        self.finish(id, r)
     }
 
     /// Mutates the cached value in place under the entry's shard write lock.
@@ -651,35 +682,33 @@ impl<T: CacheKey> SvCache<T> {
     /// `f` must not change the item's id or slug (the indices keep the values from insert;
     /// re-`insert` to change them) and must not access this cache.
     pub fn update<R>(&self, id: &T::Id, f: impl FnOnce(&mut T) -> R) -> Option<R> {
-        let now = self.now();
-        self.maybe_sweep(now);
-        let r = self
-            .by_id
-            .write(id, |e| self.hit(e, now).then(|| f(&mut e.value)).ok_or(()));
-        self.finish(id, r, now)
+        let r = self.by_id.write(id, |e| {
+            let now = self.now();
+            (now, self.hit(e, now).then(|| f(&mut e.value)).ok_or(()))
+        });
+        self.finish(id, r)
     }
 
     /// Runs `f` on the live entry for `id`, inserting `make()` first if there is none.
     ///
     /// Concurrent callers for the same id share one `make()` result and their `f` calls are
     /// serialized, so no update is lost. `make` runs under the structural lock (keep it
-    /// cheap) and must return an item whose id is `id`. Same restrictions on `f` as
-    /// [`SvCache::update`].
+    /// cheap) and must return an item whose id is `id`. A new entry's expiry is stamped when
+    /// it is installed, after `make` and `f`. Same restrictions on `f` as [`SvCache::update`].
     pub fn get_or_insert_with<R>(
         &self,
         id: T::Id,
         make: impl FnOnce() -> T,
         f: impl FnOnce(&mut T) -> R,
     ) -> R {
-        let now = self.now();
-        self.maybe_sweep(now);
         let mut f = Some(f);
         let mut existing = |e: &mut Entry<T>| {
-            self.hit(e, now)
+            self.hit(e, self.now())
                 .then(|| (f.take().expect("f unused"))(&mut e.value))
         };
         if let Some(Some(r)) = self.by_id.write(&id, &mut existing) {
             self.hits.incr();
+            self.maybe_sweep(self.now());
             return r;
         }
         let mut out = self.evicted_sink();
@@ -690,6 +719,7 @@ impl<T: CacheKey> SvCache<T> {
                 r
             }
             _ => {
+                let now = self.now();
                 if let Some((k, e)) = self.remove_locked(&mut st, &id, |e| e.expired(now)) {
                     out.push(k, e.value, EvictReason::Expired);
                 }
@@ -697,43 +727,46 @@ impl<T: CacheKey> SvCache<T> {
                 let mut item = make();
                 debug_assert!(item.id() == id, "make() returned an item with another id");
                 let r = (f.take().expect("f unused"))(&mut item);
-                self.insert_locked(&mut st, item, now, true, &mut out);
+                self.insert_locked(&mut st, item, true, &mut out);
                 r
             }
         };
         self.unlock(st);
         self.notify(out);
+        self.maybe_sweep(self.now());
         r
     }
 
     /// Marks the entry accessed and pushes its expiry to `now + ttl` (in either TTL mode).
     /// Returns false if the id is absent or expired.
     pub fn touch(&self, id: &T::Id) -> bool {
-        let now = self.now();
-        let exp = self.expiry(now);
         let r = self.by_id.read(id, |e| {
+            let now = self.now();
             if e.expired(now) {
-                return false;
+                return Err(now);
             }
             e.visited.store(true, Relaxed);
-            e.expires_at.store(exp, Relaxed);
-            true
+            Self::extend(e, self.expiry(now));
+            Ok(())
         });
-        if r == Some(false) {
-            self.reap(id, now);
+        match r {
+            Some(Ok(())) => true,
+            Some(Err(now)) => {
+                self.reap(id, now);
+                false
+            }
+            None => false,
         }
-        r == Some(true)
     }
 
     /// Removes the entry and its slug mapping. Returns `None` if absent or already expired
     /// (an expired entry is still removed, with reason `Expired`).
     pub fn remove(&self, id: &T::Id) -> Option<T> {
-        let now = self.now();
         let mut st = self.lock();
         let removed = self.remove_locked(&mut st, id, |_| true);
         self.unlock(st);
         let (k, e) = removed?;
-        if e.expired(now) {
+        if e.expired(self.now()) {
             let mut out = self.evicted_sink();
             out.push(k, e.value, EvictReason::Expired);
             self.notify(out);
@@ -756,9 +789,9 @@ impl<T: CacheKey> SvCache<T> {
         if self.ttl_ms.is_none() {
             return 0;
         }
-        let now = self.now();
         let mut out = self.evicted_sink();
         let mut st = self.lock();
+        let now = self.now();
         self.sweep_locked(&mut st, now, max_entries, &mut out);
         self.unlock(st);
         let n = out.removed;
@@ -773,13 +806,12 @@ impl<T: CacheKey> SvCache<T> {
     /// runs, but a concurrent reader may see old values for some ids and new values for
     /// others. The entry limit is enforced afterwards. Resets hit/miss counters.
     pub fn load(&self, items: Vec<T>) {
-        let now = self.now();
         let mut out = self.evicted_sink();
         let mut st = self.lock();
         let mut keep = HashSet::with_capacity(items.len());
         for item in items {
             keep.insert(item.id());
-            self.insert_locked(&mut st, item, now, false, &mut out);
+            self.insert_locked(&mut st, item, false, &mut out);
         }
         let stale: Vec<T::Id> = st
             .slots
@@ -795,6 +827,7 @@ impl<T: CacheKey> SvCache<T> {
             }
         }
         if let Some(max) = self.max_entries {
+            let now = self.now();
             while st.len > max && self.evict_one(&mut st, now, &mut out) {}
         }
         self.unlock(st);
@@ -882,29 +915,38 @@ impl<T: CacheKey> SvCache<T> {
             e.visited.store(true, Relaxed);
         }
         if self.ttl_mode == TtlMode::Sliding {
-            // Millisecond resolution keeps hot entries from rewriting this line on every hit.
-            let exp = self.expiry(now);
-            if e.expires_at.load(Relaxed) != exp {
-                e.expires_at.store(exp, Relaxed);
-            }
+            Self::extend(e, self.expiry(now));
         }
         true
     }
 
+    /// Moves expiry forward only, so a caller that sampled the clock earlier cannot undo a
+    /// newer refresh. The plain load skips the RMW while the millisecond value is unchanged.
     #[inline]
-    fn finish<R>(&self, id: &T::Id, r: Option<Result<R, ()>>, now: u64) -> Option<R> {
+    fn extend(e: &Entry<T>, exp: u64) {
+        if e.expires_at.load(Relaxed) < exp {
+            e.expires_at.fetch_max(exp, Relaxed);
+        }
+    }
+
+    /// Hit/miss accounting after a lookup; `now` is the time sampled under the entry lock.
+    #[inline]
+    fn finish<R>(&self, id: &T::Id, r: Option<(u64, Result<R, ()>)>) -> Option<R> {
         match r {
-            Some(Ok(v)) => {
+            Some((now, Ok(v))) => {
                 self.hits.incr();
+                self.maybe_sweep(now);
                 Some(v)
             }
-            Some(Err(())) => {
+            Some((now, Err(()))) => {
                 self.misses.incr();
                 self.reap(id, now);
+                self.maybe_sweep(now);
                 None
             }
             None => {
                 self.misses.incr();
+                self.maybe_sweep(self.now());
                 None
             }
         }
@@ -993,16 +1035,18 @@ impl<T: CacheKey> SvCache<T> {
         &self,
         st: &mut Order<T::Id>,
         item: T,
-        now: u64,
         enforce_limit: bool,
         out: &mut Evicted<T>,
     ) {
         let id = item.id();
         let slug: Option<Box<str>> = item.slug().map(Into::into);
+        // Sampled with the structural lock held, i.e. after any wait for it.
+        let now = self.now();
         let exp = self.expiry(now);
         let mut item = Some(item);
         let replaced = self.by_id.write(&id, |e| {
-            *e.expires_at.get_mut() = exp;
+            let cur = e.expires_at.get_mut();
+            *cur = (*cur).max(exp);
             *e.visited.get_mut() = true;
             let old = std::mem::replace(&mut e.value, item.take().expect("item"));
             (old, std::mem::replace(&mut e.slug, slug.clone()))
@@ -1112,5 +1156,46 @@ impl<T: CacheKey> SvCache<T> {
 impl<T: CacheKey> Default for SvCache<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct Item(u64);
+
+    impl CacheKey for Item {
+        type Id = u64;
+        fn id(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn expiry_of(c: &SvCache<Item>, id: u64) -> u64 {
+        c.by_id.read(&id, |e| e.expires_at.load(Relaxed)).unwrap()
+    }
+
+    // Review finding 1: a lookup that sampled the clock before a newer refresh must not move
+    // the expiry backwards.
+    #[test]
+    fn stale_sliding_refresh_does_not_move_expiry_backwards() {
+        let clock = ManualClock::new();
+        let c = SvCache::builder()
+            .ttl(Duration::from_secs(10))
+            .ttl_mode(TtlMode::Sliding)
+            .cleanup_budget(0)
+            .clock(clock.clone())
+            .build();
+        c.insert(Item(1));
+        clock.advance(Duration::from_secs(8));
+        assert!(c.get_with(&1, |_| ()).is_some());
+        assert_eq!(expiry_of(&c, 1), 18_000);
+        // A reader that sampled t=1 and was delayed until now.
+        assert!(c.by_id.read(&1, |e| c.hit(e, 1_000)).unwrap());
+        assert_eq!(expiry_of(&c, 1), 18_000);
+        clock.advance(Duration::from_secs(4));
+        assert!(c.get_with(&1, |_| ()).is_some(), "entry missed at t=12");
     }
 }

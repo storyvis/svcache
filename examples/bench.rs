@@ -124,6 +124,36 @@ fn insert_at_capacity_mt() {
     );
 }
 
+fn replace_mt() {
+    let cache = Arc::new(SvCache::with_ttl_and_limit(Duration::from_secs(60), CAP));
+    for i in 0..CAP as u64 {
+        cache.insert(session(i));
+    }
+    let per_thread = 500_000u64;
+    let start = Instant::now();
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                let mut x = 0x2545_F491_4F6C_DD1Du64 ^ (t as u64 + 1);
+                for _ in 0..per_thread {
+                    cache.insert(session(xorshift(&mut x) % CAP as u64));
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let el = start.elapsed();
+    let ops = per_thread * THREADS as u64;
+    println!(
+        "replace existing ids ({THREADS} thr, {CAP} entries): {:.2} Mops/s, len {}",
+        ops as f64 / el.as_secs_f64() / 1e6,
+        cache.len()
+    );
+}
+
 fn cleanup_latency() {
     let ttl = Duration::from_millis(200);
     let cache = SvCache::with_ttl_and_limit(ttl, CAP);
@@ -131,20 +161,24 @@ fn cleanup_latency() {
         cache.insert(session(i));
     }
     std::thread::sleep(ttl + Duration::from_millis(50));
-    // Gets on a live key while the whole table has expired: measures the worst single
-    // call that pays for inline cleanup.
-    cache.insert(session(u64::MAX));
-    let n = 20_000;
-    let mut lat: Vec<Duration> = Vec::with_capacity(n);
-    for _ in 0..n {
+    // Nothing touches the cache between expiry and the timed loop, so every inline cleanup
+    // (whatever triggers it) lands inside a timed `get_by_id`. Misses on an absent key run
+    // the same cleanup trigger as hits. Runs for 1 s so time-gated sweeps fire repeatedly.
+    let before = cache.len();
+    let mut lat: Vec<u32> = Vec::with_capacity(16 << 20);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
         let t = Instant::now();
         std::hint::black_box(cache.get_by_id(u64::MAX));
-        lat.push(t.elapsed());
+        lat.push(t.elapsed().as_nanos() as u32);
     }
-    lat.sort();
-    let p = |q: f64| lat[((n as f64 - 1.0) * q) as usize].as_nanos() as f64 / 1e3;
+    let first = lat[0] as f64 / 1e3;
+    let n = lat.len();
+    lat.sort_unstable();
+    let p = |q: f64| lat[((n as f64 - 1.0) * q) as usize] as f64 / 1e3;
     println!(
-        "get latency while {CAP} entries expire: p50 {:.2} us, p99 {:.2} us, p99.9 {:.2} us, max {:.1} us",
+        "get latency for 1 s after {CAP} entries expire ({n} calls, {} reclaimed inline): first {first:.1} us, p50 {:.2} us, p99 {:.2} us, p99.9 {:.2} us, max {:.1} us",
+        before - cache.len(),
         p(0.5),
         p(0.99),
         p(0.999),
@@ -232,6 +266,7 @@ fn main() {
     concurrent_get();
     insert_at_capacity();
     insert_at_capacity_mt();
+    replace_mt();
     cleanup_latency();
     budgeted_cleanup();
     concurrent_get_with();
