@@ -161,8 +161,9 @@ sessions.evict_expired_budget(256);
   entry still carries that slug and is live; every removal path also removes the slug
   mapping (if it still points at that id). If two ids share a slug, the last insert owns it.
 - **Concurrency.** Lookups, `update`, `touch`, and `insert` of an existing id whose slug is
-  unchanged take only the entry's shard lock. Inserts of new ids, slug changes, removals,
-  eviction, sweeps, `load` and `clear` serialize on one mutex. The clock is read after the
+  unchanged do not need the structural lock. Replacements hold the entry's shard lock and,
+  for slugged entries, a slug read lock to protect ownership. Inserts of new ids, slug changes,
+  removals, eviction, sweeps, `load` and `clear` serialize on one mutex. The clock is read after the
   relevant lock is acquired, and expiry only ever moves forward under concurrent refreshes. Closures
   passed to `get_with` / `update` / `get_or_insert_with` run under a shard lock and must not
   call back into the cache. `on_evict` runs after the entry is gone from both indices with

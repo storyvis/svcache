@@ -19,7 +19,8 @@
 //!   most once per [`SvCacheBuilder::cleanup_interval`], and by
 //!   [`SvCache::evict_expired_budget`] / [`SvCache::evict_expired`].
 //! * **Concurrency**: lookups (`get_*`, `update`, `touch`) and re-inserts of an existing id
-//!   with an unchanged slug take only the shard lock of the entry they touch. Structural
+//!   with an unchanged slug do not need the structural lock. Re-inserts take the entry's
+//!   shard lock and, for slugged entries, a slug read lock to protect ownership. Structural
 //!   changes (insert of a new id, slug change, remove, eviction, sweep, `load`, `clear`)
 //!   serialize on one mutex that guards the eviction order. The clock is sampled after the
 //!   relevant lock is held.
@@ -230,6 +231,17 @@ mod map {
             self.0.insert(k, v)
         }
 
+        /// Constructs the value after acquiring the destination shard's write lock.
+        pub fn insert_with(&self, k: K, make: impl FnOnce() -> V) -> Option<V> {
+            match self.0.entry(k) {
+                dashmap::mapref::entry::Entry::Occupied(mut e) => Some(e.insert(make())),
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    e.insert(make());
+                    None
+                }
+            }
+        }
+
         pub fn remove_if<Q>(&self, k: &Q, f: impl FnOnce(&V) -> bool) -> Option<(K, V)>
         where
             K: Borrow<Q>,
@@ -284,6 +296,12 @@ mod map {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(k, v)
+        }
+
+        /// Constructs the value after acquiring the map's write lock.
+        pub fn insert_with(&self, k: K, make: impl FnOnce() -> V) -> Option<V> {
+            let mut map = self.0.write().unwrap_or_else(PoisonError::into_inner);
+            map.insert(k, make())
         }
 
         pub fn remove_if<Q>(&self, k: &Q, f: impl FnOnce(&V) -> bool) -> Option<(K, V)>
@@ -544,7 +562,9 @@ impl<T: CacheKey> SvCacheBuilder<T> {
 pub struct SvCache<T: CacheKey> {
     by_id: Map<T::Id, Entry<T>>,
     by_slug: Map<Box<str>, T::Id>,
-    // Lock order: `order`, then at most one map shard at a time.
+    // Lock order: `order` (when needed), then `by_id`, then `by_slug`.
+    // Only fast replacements nest map locks, holding a slug read lock while
+    // replacing the value. No path holds a slug lock while acquiring an id lock.
     order: Mutex<Order<T::Id>>,
     clock: Clock,
     ttl_ms: Option<u64>,
@@ -616,25 +636,36 @@ impl<T: CacheKey> SvCache<T> {
         self.maybe_sweep(self.now());
     }
 
-    /// Replaces the value of an existing entry whose slug (and slug ownership) is unchanged,
-    /// under its shard lock only. Hands the item back when the indices must change.
+    /// Replaces an existing entry without the structural lock. Slug ownership is
+    /// protected by a read lock until the value has been replaced.
     fn try_replace(&self, item: T) -> Result<(), T> {
         let id = item.id();
-        if let Some(s) = item.slug()
-            && self.by_slug.read(s, |owner| *owner == id) != Some(true)
-        {
-            return Err(item);
-        }
         let mut item = Some(item);
         let replaced = self.by_id.write(&id, |e| {
             if e.slug.as_deref() != item.as_ref().and_then(|i| i.slug()) {
                 return None;
             }
-            let exp = self.expiry(self.now());
-            let cur = e.expires_at.get_mut();
-            *cur = (*cur).max(exp);
-            *e.visited.get_mut() = true;
-            Some(std::mem::replace(&mut e.value, item.take().expect("item")))
+            let Entry {
+                value,
+                slug,
+                visited,
+                expires_at,
+                ..
+            } = e;
+            let mut replace = || {
+                let exp = self.expiry(self.now());
+                let cur = expires_at.get_mut();
+                *cur = (*cur).max(exp);
+                *visited.get_mut() = true;
+                std::mem::replace(value, item.take().expect("item"))
+            };
+            match slug.as_deref() {
+                Some(s) => self
+                    .by_slug
+                    .read(s, |owner| (*owner == id).then(&mut replace))
+                    .flatten(),
+                None => Some(replace()),
+            }
         });
         match replaced {
             Some(Some(_old)) => Ok(()),
@@ -713,23 +744,30 @@ impl<T: CacheKey> SvCache<T> {
         }
         let mut out = self.evicted_sink();
         let mut st = self.lock();
-        let r = match self.by_id.write(&id, &mut existing) {
-            Some(Some(r)) => {
-                self.hits.incr();
-                r
-            }
-            _ => {
-                let now = self.now();
-                if let Some((k, e)) = self.remove_locked(&mut st, &id, |e| e.expired(now)) {
+        let r = loop {
+            match self.by_id.write(&id, &mut existing) {
+                Some(Some(r)) => {
+                    self.hits.incr();
+                    break r;
+                }
+                Some(None) => {
+                    // A fast replacement can refresh the entry without `order`.
+                    // If that happened, retry against the live value instead of
+                    // constructing a new value and overwriting the replacement.
+                    let Some((k, e)) = self.remove_locked(&mut st, &id, |e| e.expired(self.now()))
+                    else {
+                        continue;
+                    };
                     out.push(k, e.value, EvictReason::Expired);
                 }
-                self.misses.incr();
-                let mut item = make();
-                debug_assert!(item.id() == id, "make() returned an item with another id");
-                let r = (f.take().expect("f unused"))(&mut item);
-                self.insert_locked(&mut st, item, true, &mut out);
-                r
+                None => {}
             }
+            self.misses.incr();
+            let mut item = make();
+            debug_assert!(item.id() == id, "make() returned an item with another id");
+            let r = (f.take().expect("f unused"))(&mut item);
+            self.insert_locked(&mut st, item, true, &mut out);
+            break r;
         };
         self.unlock(st);
         self.notify(out);
@@ -1040,11 +1078,9 @@ impl<T: CacheKey> SvCache<T> {
     ) {
         let id = item.id();
         let slug: Option<Box<str>> = item.slug().map(Into::into);
-        // Sampled with the structural lock held, i.e. after any wait for it.
-        let now = self.now();
-        let exp = self.expiry(now);
         let mut item = Some(item);
         let replaced = self.by_id.write(&id, |e| {
+            let exp = self.expiry(self.now());
             let cur = e.expires_at.get_mut();
             *cur = (*cur).max(exp);
             *e.visited.get_mut() = true;
@@ -1061,16 +1097,16 @@ impl<T: CacheKey> SvCache<T> {
             }
             None => {
                 if enforce_limit && let Some(max) = self.max_entries {
-                    while st.len >= max && self.evict_one(st, now, out) {}
+                    while st.len >= max && self.evict_one(st, self.now(), out) {}
                 }
-                let entry = Entry {
+                self.by_id.insert_with(id.clone(), || Entry {
                     value: item.take().expect("item"),
                     slug: slug.clone(),
                     node: st.push_head(id.clone()),
                     visited: AtomicBool::new(false),
-                    expires_at: AtomicU64::new(exp),
-                };
-                self.by_id.insert(id.clone(), entry);
+                    // Both eviction and the destination shard wait are over.
+                    expires_at: AtomicU64::new(self.expiry(self.now())),
+                });
             }
         }
         if let Some(s) = slug {
