@@ -187,6 +187,7 @@ fn test_evict_expired() {
     assert_eq!(cache.len(), 0);
 }
 
+#[cfg(feature = "stats")]
 #[test]
 fn test_metadata() {
     let cache = SvCache::new();
