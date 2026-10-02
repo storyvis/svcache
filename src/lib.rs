@@ -231,13 +231,14 @@ mod map {
             self.0.insert(k, v)
         }
 
-        /// Constructs the value after acquiring the destination shard's write lock.
-        pub fn insert_with(&self, k: K, make: impl FnOnce() -> V) -> Option<V> {
+        /// Inserts `make()` only if `k` is vacant, constructing it under the destination
+        /// shard's write lock. Returns false (without calling `make`) if `k` is occupied.
+        pub fn insert_vacant(&self, k: K, make: impl FnOnce() -> V) -> bool {
             match self.0.entry(k) {
-                dashmap::mapref::entry::Entry::Occupied(mut e) => Some(e.insert(make())),
+                dashmap::mapref::entry::Entry::Occupied(_) => false,
                 dashmap::mapref::entry::Entry::Vacant(e) => {
                     e.insert(make());
-                    None
+                    true
                 }
             }
         }
@@ -298,10 +299,17 @@ mod map {
                 .insert(k, v)
         }
 
-        /// Constructs the value after acquiring the map's write lock.
-        pub fn insert_with(&self, k: K, make: impl FnOnce() -> V) -> Option<V> {
+        /// Inserts `make()` only if `k` is vacant, constructing it under the map's write
+        /// lock. Returns false (without calling `make`) if `k` is occupied.
+        pub fn insert_vacant(&self, k: K, make: impl FnOnce() -> V) -> bool {
             let mut map = self.0.write().unwrap_or_else(PoisonError::into_inner);
-            map.insert(k, make())
+            match map.entry(k) {
+                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(make());
+                    true
+                }
+            }
         }
 
         pub fn remove_if<Q>(&self, k: &Q, f: impl FnOnce(&V) -> bool) -> Option<(K, V)>
@@ -744,6 +752,12 @@ impl<T: CacheKey> SvCache<T> {
         }
         let mut out = self.evicted_sink();
         let mut st = self.lock();
+        // Terminates: `existing` misses only when the entry is expired (`hit`), the clock is
+        // monotonic, and expiry only moves forward. A miss is followed either by removing the
+        // still-expired entry (then inserting) or by finding it revived by a fast replacement,
+        // which the next attempt hits unless it has expired again in between.
+        #[cfg(debug_assertions)]
+        let mut revived = 0u32;
         let r = loop {
             match self.by_id.write(&id, &mut existing) {
                 Some(Some(r)) => {
@@ -756,6 +770,11 @@ impl<T: CacheKey> SvCache<T> {
                     // constructing a new value and overwriting the replacement.
                     let Some((k, e)) = self.remove_locked(&mut st, &id, |e| e.expired(self.now()))
                     else {
+                        #[cfg(debug_assertions)]
+                        {
+                            revived += 1;
+                            debug_assert!(revived < 10_000, "get_or_insert_with: entry revived 10k times");
+                        }
                         continue;
                     };
                     out.push(k, e.value, EvictReason::Expired);
@@ -1099,7 +1118,10 @@ impl<T: CacheKey> SvCache<T> {
                 if enforce_limit && let Some(max) = self.max_entries {
                     while st.len >= max && self.evict_one(st, self.now(), out) {}
                 }
-                self.by_id.insert_with(id.clone(), || Entry {
+                // Vacant-only, so the order list can never gain a second node for `id`. The
+                // slot can't be taken here: new ids are inserted only under `order` (held),
+                // and fast replacements only replace existing entries.
+                let inserted = self.by_id.insert_vacant(id.clone(), || Entry {
                     value: item.take().expect("item"),
                     slug: slug.clone(),
                     node: st.push_head(id.clone()),
@@ -1107,6 +1129,7 @@ impl<T: CacheKey> SvCache<T> {
                     // Both eviction and the destination shard wait are over.
                     expires_at: AtomicU64::new(self.expiry(self.now())),
                 });
+                debug_assert!(inserted, "new-id insert found the id present while holding `order`");
             }
         }
         if let Some(s) = slug {
@@ -1198,6 +1221,19 @@ impl<T: CacheKey> Default for SvCache<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn insert_vacant_never_constructs_over_an_occupied_key() {
+        let m: map::Map<u64, u64> = map::Map::new();
+        assert!(m.insert_vacant(1, || 10));
+        let mut called = false;
+        assert!(!m.insert_vacant(1, || {
+            called = true;
+            20
+        }));
+        assert!(!called, "make ran for an occupied key");
+        assert_eq!(m.read(&1, |v| *v), Some(10));
+    }
 
     #[derive(Clone)]
     struct Item(u64);
