@@ -1,6 +1,6 @@
 [package]
 name = "svcache"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["lava bokam <lavajnv@gmail.com>"]
 description = "Isomorphic Dual-Index Cache for WASM and Native Runtimes"
@@ -18,6 +18,14 @@ serde = { version = "1.0", features = ["derive"] }
 # Only bring in DashMap when NOT targeting WebAssembly
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 dashmap = "6.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1.1"
+
+[features]
+default = ["stats"]
+# Hit/miss counters (striped per thread). Disable to drop the per-lookup atomic increment.
+stats = []
 
 [dev-dependencies]
 chrono = { version = "0.4", features = ["serde", "clock"] }
