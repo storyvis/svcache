@@ -1,5 +1,5 @@
-use svcache::{CacheKey, SvCache};
 use std::time::Duration;
+use svcache::{CacheKey, SvCache};
 
 /// Test struct implementing CacheKey
 #[derive(Clone, Debug, PartialEq)]
@@ -209,10 +209,7 @@ fn test_metadata() {
 #[test]
 fn test_metadata_after_load() {
     let cache = SvCache::new();
-    let items = vec![
-        make_user(1, "Alice", None),
-        make_user(2, "Bob", None),
-    ];
+    let items = vec![make_user(1, "Alice", None), make_user(2, "Bob", None)];
 
     cache.load(items);
 

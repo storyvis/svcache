@@ -773,7 +773,10 @@ impl<T: CacheKey> SvCache<T> {
                         #[cfg(debug_assertions)]
                         {
                             revived += 1;
-                            debug_assert!(revived < 10_000, "get_or_insert_with: entry revived 10k times");
+                            debug_assert!(
+                                revived < 10_000,
+                                "get_or_insert_with: entry revived 10k times"
+                            );
                         }
                         continue;
                     };
@@ -1129,7 +1132,10 @@ impl<T: CacheKey> SvCache<T> {
                     // Both eviction and the destination shard wait are over.
                     expires_at: AtomicU64::new(self.expiry(self.now())),
                 });
-                debug_assert!(inserted, "new-id insert found the id present while holding `order`");
+                debug_assert!(
+                    inserted,
+                    "new-id insert found the id present while holding `order`"
+                );
             }
         }
         if let Some(s) = slug {
