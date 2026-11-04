@@ -107,7 +107,7 @@ pub enum TtlMode {
 }
 
 /// A manually advanced clock for deterministic tests, or for hosts that drive time
-/// themselves. Clones share the same time.
+/// themselves. Clones share the same time. Advances saturate at `u64::MAX` milliseconds.
 #[derive(Debug, Clone, Default)]
 pub struct ManualClock(Arc<AtomicU64>);
 
@@ -117,7 +117,10 @@ impl ManualClock {
     }
 
     pub fn advance(&self, by: Duration) {
-        self.0.fetch_add(duration_ms(by), Relaxed);
+        let by = duration_ms(by);
+        let _ = self
+            .0
+            .fetch_update(Relaxed, Relaxed, |now| Some(now.saturating_add(by)));
     }
 
     pub fn now(&self) -> Duration {
@@ -382,7 +385,7 @@ impl<K> Order<K> {
             head: NIL,
             tail: NIL,
             hand: NIL,
-            cursor: 0,
+            cursor: NIL,
             len: 0,
         }
     }
@@ -418,6 +421,7 @@ impl<K> Order<K> {
         self.head = idx;
         if self.tail == NIL {
             self.tail = idx;
+            self.cursor = idx;
         }
         self.len += 1;
         idx
@@ -435,6 +439,13 @@ impl<K> Order<K> {
         }
         if self.hand == idx {
             self.hand = node.newer;
+        }
+        if self.cursor == idx {
+            self.cursor = if node.newer == NIL {
+                self.tail
+            } else {
+                node.newer
+            };
         }
         self.len -= 1;
         if self.len == 0 {
@@ -843,8 +854,9 @@ impl<T: CacheKey> SvCache<T> {
         self.evict_expired_budget(usize::MAX)
     }
 
-    /// Examines at most `max_entries` entries, continuing where the previous sweep stopped,
-    /// and removes the expired ones. Returns the number removed.
+    /// Examines at most `max_entries` live slots, continuing where the previous sweep
+    /// stopped, and removes expired entries. Removed slots do not consume the budget.
+    /// Returns the number removed.
     pub fn evict_expired_budget(&self, max_entries: usize) -> usize {
         if self.ttl_ms.is_none() {
             return 0;
@@ -1031,28 +1043,30 @@ impl<T: CacheKey> SvCache<T> {
     fn maybe_sweep(&self, now: u64) {
         if self.cleanup_budget != 0 && self.ttl_ms.is_some() && now >= self.next_sweep.load(Relaxed)
         {
-            self.sweep_due(now);
+            self.sweep_due();
         }
     }
 
     #[cold]
-    fn sweep_due(&self, now: u64) {
-        let next = self.next_sweep.load(Relaxed);
-        let claimed = now >= next
-            && self
-                .next_sweep
-                .compare_exchange(next, now + self.cleanup_interval_ms, Relaxed, Relaxed)
-                .is_ok();
-        if !claimed {
-            return;
-        }
+    fn sweep_due(&self) {
         let Some(mut st) = self.try_lock() else {
             return;
         };
         let mut out = self.evicted_sink();
-        self.sweep_locked(&mut st, now, self.cleanup_budget, &mut out);
+        self.sweep_if_due_locked(&mut st, self.now(), &mut out);
         self.unlock(st);
         self.notify(out);
+    }
+
+    // Advance the deadline only after acquiring the structural lock. A busy
+    // cache must not consume a cleanup interval without doing any cleanup.
+    fn sweep_if_due_locked(&self, st: &mut Order<T::Id>, now: u64, out: &mut Evicted<T>) {
+        if self.cleanup_budget != 0 && self.ttl_ms.is_some() && now >= self.next_sweep.load(Relaxed)
+        {
+            self.next_sweep
+                .store(now.saturating_add(self.cleanup_interval_ms), Relaxed);
+            self.sweep_locked(st, now, self.cleanup_budget, out);
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Order<T::Id>> {
@@ -1098,6 +1112,11 @@ impl<T: CacheKey> SvCache<T> {
         enforce_limit: bool,
         out: &mut Evicted<T>,
     ) {
+        // A zero limit disables retention, including bulk loads. No entry is
+        // installed, so there is no eviction callback for the discarded value.
+        if self.max_entries == Some(0) {
+            return;
+        }
         let id = item.id();
         let slug: Option<Box<str>> = item.slug().map(Into::into);
         let mut item = Some(item);
@@ -1119,6 +1138,11 @@ impl<T: CacheKey> SvCache<T> {
             }
             None => {
                 if enforce_limit && let Some(max) = self.max_entries {
+                    if st.len >= max {
+                        // Use already-due cleanup before choosing a live SIEVE
+                        // victim. The interval and budget remain bounded.
+                        self.sweep_if_due_locked(st, self.now(), out);
+                    }
                     while st.len >= max && self.evict_one(st, self.now(), out) {}
                 }
                 // Vacant-only, so the order list can never gain a second node for `id`. The
@@ -1198,19 +1222,17 @@ impl<T: CacheKey> SvCache<T> {
     }
 
     fn sweep_locked(&self, st: &mut Order<T::Id>, now: u64, budget: usize, out: &mut Evicted<T>) {
-        for _ in 0..budget.min(st.slots.len()) {
-            if st.slots.is_empty() {
-                break;
-            }
-            if st.cursor >= st.slots.len() {
-                st.cursor = 0;
-            }
+        // Walk live insertion-order links, not historical slab slots: holes
+        // left by removals must not consume the caller's cleanup budget.
+        for _ in 0..budget.min(st.len) {
             let i = st.cursor;
-            st.cursor += 1;
-            let Some(node) = &st.slots[i] else {
-                continue;
-            };
+            let node = st.node(i);
             let key = node.key.clone();
+            st.cursor = if node.newer == NIL {
+                st.tail
+            } else {
+                node.newer
+            };
             if let Some((k, e)) = self.remove_locked(st, &key, |e| e.expired(now)) {
                 out.push(k, e.value, EvictReason::Expired);
             }
@@ -1253,6 +1275,25 @@ mod tests {
 
     fn expiry_of(c: &SvCache<Item>, id: u64) -> u64 {
         c.by_id.read(&id, |e| e.expires_at.load(Relaxed)).unwrap()
+    }
+
+    #[test]
+    fn busy_structural_lock_does_not_consume_due_cleanup() {
+        let clock = ManualClock::new();
+        let c = SvCache::builder()
+            .ttl(Duration::from_secs(10))
+            .cleanup_interval(Duration::from_secs(10))
+            .clock(clock.clone())
+            .build();
+        c.insert(Item(1));
+        let held = c.lock();
+        clock.advance(Duration::from_secs(11));
+        // Model the lock held by another structural operation. A miss must
+        // remain nonblocking, but the next request must still attempt cleanup.
+        assert!(c.get_by_id(2).is_none());
+        c.unlock(held);
+        assert!(c.get_by_id(2).is_none());
+        assert!(c.is_empty());
     }
 
     // Review finding 1: a lookup that sampled the clock before a newer refresh must not move

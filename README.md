@@ -148,15 +148,24 @@ sessions.evict_expired_budget(256);
   clearing set bits and evicting the first entry whose bit is clear; expired entries are
   evicted regardless. New entries start unvisited. Without hits this is exact FIFO. The
   entry limit is exact, also under concurrent inserts.
+- **Zero capacity.** `max_entries(0)` disables retention. Inserts and loads discard their
+  inputs without eviction callbacks because no entry is installed. `get_or_insert_with`
+  still runs `make` and `f` and returns their result, but does not retain the value.
 - **Clock.** Monotonic: `std::time::Instant` natively, `performance.now()` via
   [`web-time`](https://crates.io/crates/web-time) on `wasm32`. Millisecond resolution; an
-  entry is expired once more than `ttl` has passed. `ManualClock` can be injected for tests.
+  entry is expired once more than `ttl` has passed. `ManualClock` can be injected for tests;
+  advancing past its `u64` millisecond range saturates rather than wrapping backwards.
 - **TTL mode.** `Fixed` (default): expiry is set on insert/re-insert. `Sliding`: every
   successful lookup or `update` also moves expiry to `now + ttl`. `touch` refreshes in both.
 - **Cleanup.** Expired entries are never returned. They are reclaimed when a lookup finds
   them, when the eviction hand reaches them, by an inline sweep of at most `cleanup_budget`
   entries (default 64) that runs at most once per `cleanup_interval` (default
   `min(ttl / 4, 1 s)`), and by `evict_expired_budget` / `evict_expired`.
+  Sweeps follow live entries, so removed slab slots do not consume the budget after a
+  cache shrinks. A due sweep runs before capacity eviction on new-id insertion; it remains
+  interval- and budget-limited, so it does not promise to find every expired entry before
+  evicting a live one. A failed nonblocking lock attempt leaves cleanup due for the next
+  request. Slab storage may still reflect the cache's historical peak until emptied.
 - **Indices.** Each entry stores the slug it is indexed under. A slug lookup only hits if the
   entry still carries that slug and is live; every removal path also removes the slug
   mapping (if it still points at that id). If two ids share a slug, the last insert owns it.
@@ -177,6 +186,37 @@ sessions.evict_expired_budget(256);
 | Feature | Default | Effect |
 |---------|---------|--------|
 | `stats` | on | Hit/miss counters (striped across cache lines). Disable to skip the per-lookup increment; `metadata()` then reports 0 hits/misses. |
+
+## Reproducing expiry measurements
+
+`cargo run --release --locked --example expiry_bench` emits five trials of CSV for sparse
+and dense cleanup, a fixed-TTL retention trace, mixed hot/scan SIEVE requests, and capacity
+churn. Copy the same example into the baseline checkout and run both builds on a quiet
+host. The request sequences and hit counts are deterministic; elapsed times are measurements,
+not pass/fail thresholds. The small TTL trace isolates expiry/admission ordering and does
+not represent an application workload. The original `bench` example also exercises threaded
+lookups and replacements.
+
+Measured on 2026-11-05 against `90fcbad` with the same example and separate release target
+directories: Apple M4 Pro (12 logical CPUs), macOS 26.5.1, Rust 1.95.0, default `stats`
+feature. Three alternating runs per revision contain five trials each (15 samples below).
+Builds were paused; an unrelated Slurm controller used about one CPU and desktop/API
+processes remained active. These are synthetic measurements, not isolated-host guarantees.
+
+| Trace | Baseline | Updated |
+|---|---:|---:|
+| Reclaim 64 expired entries after a 32,768-entry peak, budget 64 | 512 calls | 1 call |
+| Same sparse cleanup, median elapsed | 24.292 µs | 1.958 µs |
+| Reclaim 32,768 expired entries, budget 64 | 512 calls | 512 calls |
+| Same dense cleanup, median elapsed | 1,023.291 µs | 996.250 µs |
+| TTL-pressure probe hits (purpose-built ordering regression) | 0 / 1,000 | 1,000 / 1,000 |
+| Mixed hot/scan SIEVE hits | 179,936 / 200,000 | 179,936 / 200,000 |
+
+The existing threaded `bench` example ran once per alternating run. Median `get_by_id`
+throughput was 54.6 → 54.7 Mops/s; single-thread TTL capacity insertion was 316.6 →
+325.2 ns/op (about 2.7% slower). These do not establish a general workload speedup.
+The normal hit path is unchanged until cleanup is due; a failed cleanup lock attempt
+now remains due and can cause further nonblocking probes during sustained contention.
 
 ## Implementing `CacheKey`
 
