@@ -1,6 +1,6 @@
 [package]
 name = "svcache"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["lava bokam <lavajnv@gmail.com>"]
 description = "Isomorphic Dual-Index Cache for WASM and Native Runtimes"
